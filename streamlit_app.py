@@ -1,5 +1,4 @@
 import io
-import base64
 import hashlib
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
@@ -34,13 +33,6 @@ def render_page_cached(pdf_md5: str, pdf_bytes: bytes, page_index: int, zoom: fl
     pr = PageRender(image=img, page_w_pt=page.rect.width, page_h_pt=page.rect.height)
     doc.close()
     return pr
-
-
-def pil_to_data_url(img: Image.Image, fmt: str = "PNG") -> str:
-    buf = io.BytesIO()
-    img.save(buf, format=fmt)
-    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-    return f"data:image/{fmt.lower()};base64,{b64}"
 
 
 def rect_disp_to_rect_pt(
@@ -256,6 +248,7 @@ if not pdf_file:
 pdf_bytes = pdf_file.getvalue()
 pdf_hash = md5_bytes(pdf_bytes)
 
+# Stamp: converter SEMPRE para PNG em memória
 stamp_png_bytes = None
 stamp_pil = None
 if stamp_file:
@@ -298,13 +291,12 @@ disp_img = img.resize((disp_w, disp_h), Image.LANCZOS)
 
 st.subheader(f"1) Desenha um rectângulo na página (modo actual: **{mode}**)")
 
-bg_url = pil_to_data_url(disp_img, "PNG")
-
+# IMPORTANT: a API do st_canvas aceita background_image (PIL). O package "-fix" trata da compatibilidade com Streamlit recente.
 canvas_result = st_canvas(
     fill_color="rgba(0, 0, 0, 0)",
     stroke_width=2,
     stroke_color="#ff0000",
-    background_image_url=bg_url,
+    background_image=disp_img,
     update_streamlit=True,
     height=disp_h,
     width=disp_w,
@@ -399,4 +391,4 @@ if st.button("Gerar PDF final", disabled=not can_generate):
         mime="application/pdf",
     )
 
-st.caption("Dica: define áreas por página e clica sempre em “Guardar área deste rectângulo”. O stamp é convertido para PNG em memória.")
+st.caption("Dica: escolhe o modo (texto/stamp), desenha o rectângulo e clica em “Guardar área deste rectângulo”. O stamp é convertido para PNG em memória.")
