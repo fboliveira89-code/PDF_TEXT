@@ -1,4 +1,5 @@
 import io
+import base64
 import hashlib
 from dataclasses import dataclass
 from typing import Dict, Tuple, Optional
@@ -8,7 +9,6 @@ import fitz  # PyMuPDF
 from PIL import Image, ImageDraw, ImageFont
 
 from streamlit_drawable_canvas import st_canvas
-
 
 RectPT = Tuple[float, float, float, float]  # (x0,y0,x1,y1) em pontos (PDF)
 
@@ -36,6 +36,13 @@ def render_page_cached(pdf_md5: str, pdf_bytes: bytes, page_index: int, zoom: fl
     return pr
 
 
+def pil_to_data_url(img: Image.Image, fmt: str = "PNG") -> str:
+    buf = io.BytesIO()
+    img.save(buf, format=fmt)
+    b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+    return f"data:image/{fmt.lower()};base64,{b64}"
+
+
 def rect_disp_to_rect_pt(
     rect_disp: Tuple[float, float, float, float],
     display_scale: float,
@@ -48,19 +55,16 @@ def rect_disp_to_rect_pt(
     x0d, x1d = sorted([x0d, x1d])
     y0d, y1d = sorted([y0d, y1d])
 
-    # display px -> image px (original render)
     x0 = x0d / display_scale
     y0 = y0d / display_scale
     x1 = x1d / display_scale
     y1 = y1d / display_scale
 
-    # clamp
     x0 = max(0.0, min(float(img_w_px), x0))
     x1 = max(0.0, min(float(img_w_px), x1))
     y0 = max(0.0, min(float(img_h_px), y0))
     y1 = max(0.0, min(float(img_h_px), y1))
 
-    # image px -> page pt
     sx = page_w_pt / img_w_px
     sy = page_h_pt / img_h_px
     return (x0 * sx, y0 * sy, x1 * sx, y1 * sy)
@@ -127,7 +131,7 @@ def build_preview_image(
     draw = ImageDraw.Draw(img, "RGBA")
 
     img_w, img_h = img.size
-    px_per_pt = img_w / page_w_pt  # ~ zoom
+    px_per_pt = img_w / page_w_pt
 
     font_px = max(10, int(font_pt * px_per_pt))
     try:
@@ -187,7 +191,7 @@ def apply_edits_to_pdf(
     rects_by_page: Dict[int, Dict[str, RectPT]],
     message: str,
     font_pt: int,
-    stamp_bytes: Optional[bytes],
+    stamp_png_bytes: Optional[bytes],
     keep_ratio: bool,
 ):
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -208,11 +212,11 @@ def apply_edits_to_pdf(
                 align=0,
             )
 
-        if "stamp" in d and stamp_bytes:
+        if "stamp" in d and stamp_png_bytes:
             r = fitz.Rect(*d["stamp"])
             page.insert_image(
                 r,
-                stream=stamp_bytes,
+                stream=stamp_png_bytes,
                 keep_proportion=keep_ratio,
                 overlay=True
             )
@@ -243,6 +247,8 @@ with st.sidebar:
     st.header("Modo de selecção")
     mode = st.radio("Atribuir rectângulo a:", ["texto", "stamp"], horizontal=True)
 
+    show_debug = st.checkbox("Mostrar debug", value=False)
+
 if not pdf_file:
     st.info("Faz upload de um PDF para começar.")
     st.stop()
@@ -250,13 +256,17 @@ if not pdf_file:
 pdf_bytes = pdf_file.getvalue()
 pdf_hash = md5_bytes(pdf_bytes)
 
-stamp_bytes = None
+stamp_png_bytes = None
 stamp_pil = None
 if stamp_file:
-    stamp_bytes = stamp_file.getvalue()
+    raw = stamp_file.getvalue()
     try:
-        stamp_pil = Image.open(io.BytesIO(stamp_bytes)).convert("RGBA")
+        stamp_pil = Image.open(io.BytesIO(raw)).convert("RGBA")
+        buf = io.BytesIO()
+        stamp_pil.save(buf, format="PNG")
+        stamp_png_bytes = buf.getvalue()
     except Exception:
+        stamp_png_bytes = raw
         stamp_pil = None
 
 doc_tmp = fitz.open(stream=pdf_bytes, filetype="pdf")
@@ -280,7 +290,7 @@ pr = render_page_cached(pdf_hash, pdf_bytes, page_index, ZOOM_RENDER)
 img = pr.image
 page_w_pt, page_h_pt = pr.page_w_pt, pr.page_h_pt
 
-MAX_W = 950
+MAX_W = 900
 disp_w = min(MAX_W, img.width)
 display_scale = disp_w / img.width
 disp_h = int(img.height * display_scale)
@@ -288,11 +298,13 @@ disp_img = img.resize((disp_w, disp_h), Image.LANCZOS)
 
 st.subheader(f"1) Desenha um rectângulo na página (modo actual: **{mode}**)")
 
+bg_url = pil_to_data_url(disp_img, "PNG")
+
 canvas_result = st_canvas(
     fill_color="rgba(0, 0, 0, 0)",
     stroke_width=2,
     stroke_color="#ff0000",
-    background_image=disp_img,
+    background_image_url=bg_url,
     update_streamlit=True,
     height=disp_h,
     width=disp_w,
@@ -334,6 +346,12 @@ page_rects = st.session_state.rects_by_page.get(page_index, {})
 rect_text_pt = page_rects.get("texto")
 rect_stamp_pt = page_rects.get("stamp")
 
+if show_debug:
+    st.sidebar.markdown("### Debug")
+    st.sidebar.write("rect_text_pt:", rect_text_pt)
+    st.sidebar.write("rect_stamp_pt:", rect_stamp_pt)
+    st.sidebar.write("stamp_png_bytes:", None if stamp_png_bytes is None else len(stamp_png_bytes))
+
 st.subheader("2) Preview (com overlays)")
 preview = build_preview_image(
     base_img=img,
@@ -357,7 +375,7 @@ if not st.session_state.rects_by_page:
     can_generate = False
     st.warning("Ainda não definiste nenhuma área (texto/stamp).")
 
-if rect_stamp_pt and not stamp_bytes:
+if rect_stamp_pt and not stamp_png_bytes:
     st.warning("Definiste área de stamp nesta página, mas ainda não carregaste o stamp.")
     can_generate = False
 
@@ -369,7 +387,7 @@ if st.button("Gerar PDF final", disabled=not can_generate):
         rects_by_page=rects_to_apply,
         message=message,
         font_pt=int(font_pt),
-        stamp_bytes=stamp_bytes,
+        stamp_png_bytes=stamp_png_bytes,
         keep_ratio=keep_ratio,
     )
 
@@ -381,4 +399,4 @@ if st.button("Gerar PDF final", disabled=not can_generate):
         mime="application/pdf",
     )
 
-st.caption("Dica: define áreas por página. O stamp é aplicado com stream=bytes (não depende do ficheiro no disco).")
+st.caption("Dica: define áreas por página e clica sempre em “Guardar área deste rectângulo”. O stamp é convertido para PNG em memória.")

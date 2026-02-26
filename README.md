@@ -13,6 +13,5 @@ streamlit run streamlit_app.py
 ```
 
 ### Deploy no Streamlit Community Cloud
-1. Faz push deste projecto para GitHub
-2. Streamlit Cloud → New app
-3. Escolhe o repo e define **Main file path** como `streamlit_app.py`
+Repo: `fboliveira89-code/PDF_TEXT`
+Main file: `streamlit_app.py`
