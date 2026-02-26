@@ -7,16 +7,16 @@ import streamlit as st
 import fitz  # PyMuPDF
 from PIL import Image, ImageDraw, ImageFont
 
-from streamlit_drawable_canvas import st_canvas
+from streamlit_image_coordinates import streamlit_image_coordinates
 
 RectPT = Tuple[float, float, float, float]  # (x0,y0,x1,y1) em pontos (PDF)
 
 
 @dataclass
 class PageRender:
-    image: Image.Image         # imagem renderizada (pixels)
-    page_w_pt: float           # largura da página em pontos
-    page_h_pt: float           # altura da página em pontos
+    image: Image.Image
+    page_w_pt: float
+    page_h_pt: float
 
 
 def md5_bytes(b: bytes) -> str:
@@ -47,16 +47,19 @@ def rect_disp_to_rect_pt(
     x0d, x1d = sorted([x0d, x1d])
     y0d, y1d = sorted([y0d, y1d])
 
+    # display px -> image px
     x0 = x0d / display_scale
     y0 = y0d / display_scale
     x1 = x1d / display_scale
     y1 = y1d / display_scale
 
+    # clamp
     x0 = max(0.0, min(float(img_w_px), x0))
     x1 = max(0.0, min(float(img_w_px), x1))
     y0 = max(0.0, min(float(img_h_px), y0))
     y1 = max(0.0, min(float(img_h_px), y1))
 
+    # image px -> page pt
     sx = page_w_pt / img_w_px
     sy = page_h_pt / img_h_px
     return (x0 * sx, y0 * sy, x1 * sx, y1 * sy)
@@ -69,30 +72,12 @@ def rect_pt_to_rect_px(rect_pt: RectPT, img_w_px: int, img_h_px: int, page_w_pt:
     return (x0 * sx, y0 * sy, x1 * sx, y1 * sy)
 
 
-def get_last_rect_from_canvas(canvas_json) -> Optional[Tuple[float, float, float, float]]:
-    if not canvas_json or "objects" not in canvas_json or not canvas_json["objects"]:
-        return None
-
-    rects = [o for o in canvas_json["objects"] if o.get("type") == "rect"]
-    if not rects:
-        return None
-    o = rects[-1]
-
-    left = float(o.get("left", 0.0))
-    top = float(o.get("top", 0.0))
-    w = float(o.get("width", 0.0)) * float(o.get("scaleX", 1.0))
-    h = float(o.get("height", 0.0)) * float(o.get("scaleY", 1.0))
-
-    return (left, top, left + w, top + h)
-
-
 def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int):
     lines = []
     for paragraph in (text or "").replace("\r\n", "\n").split("\n"):
         if paragraph.strip() == "":
             lines.append("")
             continue
-
         words = paragraph.split(" ")
         cur = ""
         for w in words:
@@ -118,6 +103,8 @@ def build_preview_image(
     font_pt: int,
     stamp_pil: Optional[Image.Image],
     keep_ratio: bool,
+    selecting_rect_disp: Optional[Tuple[float, float, float, float]] = None,
+    display_scale: float = 1.0,
 ):
     img = base_img.copy().convert("RGBA")
     draw = ImageDraw.Draw(img, "RGBA")
@@ -131,6 +118,18 @@ def build_preview_image(
     except Exception:
         font = ImageFont.load_default()
 
+    # mostrar rect em progresso (em display coords -> converte para image coords)
+    if selecting_rect_disp is not None:
+        x0d, y0d, x1d, y1d = selecting_rect_disp
+        x0d, x1d = sorted([x0d, x1d])
+        y0d, y1d = sorted([y0d, y1d])
+        x0 = int((x0d / display_scale))
+        y0 = int((y0d / display_scale))
+        x1 = int((x1d / display_scale))
+        y1 = int((y1d / display_scale))
+        draw.rectangle([x0, y0, x1, y1], outline=(255, 0, 0, 220), width=4)
+
+    # TEXTO
     if rect_text_pt and message.strip():
         x0, y0, x1, y1 = rect_pt_to_rect_px(rect_text_pt, img_w, img_h, page_w_pt, page_h_pt)
         x0, y0, x1, y1 = map(int, [x0, y0, x1, y1])
@@ -152,6 +151,7 @@ def build_preview_image(
             draw.text((x0 + pad, yy), ln, font=font, fill=(0, 0, 0, 255))
             yy += line_h
 
+    # STAMP
     if rect_stamp_pt and stamp_pil is not None:
         x0, y0, x1, y1 = rect_pt_to_rect_px(rect_stamp_pt, img_w, img_h, page_w_pt, page_h_pt)
         x0, y0, x1, y1 = map(int, [x0, y0, x1, y1])
@@ -218,13 +218,18 @@ def apply_edits_to_pdf(
     return out
 
 
+# ---------------- UI ----------------
 st.set_page_config(page_title="PDF Texto + Stamp", layout="wide")
 st.title("PDF: inserir mensagem + stamp (Streamlit)")
 
 if "page_index" not in st.session_state:
     st.session_state.page_index = 0
 if "rects_by_page" not in st.session_state:
-    st.session_state.rects_by_page = {}
+    st.session_state.rects_by_page = {}  # {page: {"texto": rect_pt, "stamp": rect_pt}}
+if "click_stage" not in st.session_state:
+    st.session_state.click_stage = 0  # 0 = à espera do 1º clique, 1 = à espera do 2º clique
+if "p1" not in st.session_state:
+    st.session_state.p1 = None  # (x,y) em coords display px
 
 with st.sidebar:
     st.header("Ficheiros")
@@ -262,78 +267,156 @@ if stamp_file:
         stamp_png_bytes = raw
         stamp_pil = None
 
+# número de páginas
 doc_tmp = fitz.open(stream=pdf_bytes, filetype="pdf")
 page_count = doc_tmp.page_count
 doc_tmp.close()
 
-col_nav1, col_nav2, col_nav3, _ = st.columns([1, 1, 2, 6], vertical_alignment="center")
+# navegação
+col_nav1, col_nav2, col_nav3, col_nav4 = st.columns([1, 1, 2, 6], vertical_alignment="center")
 with col_nav1:
     if st.button("◀ Página", disabled=(st.session_state.page_index <= 0)):
         st.session_state.page_index -= 1
+        st.session_state.click_stage = 0
+        st.session_state.p1 = None
 with col_nav2:
     if st.button("Página ▶", disabled=(st.session_state.page_index >= page_count - 1)):
         st.session_state.page_index += 1
+        st.session_state.click_stage = 0
+        st.session_state.p1 = None
 with col_nav3:
     st.markdown(f"**Página {st.session_state.page_index + 1}/{page_count}**")
 
 page_index = st.session_state.page_index
 
+# render (alta resolução para preview + precisão)
 ZOOM_RENDER = 2.0
 pr = render_page_cached(pdf_hash, pdf_bytes, page_index, ZOOM_RENDER)
 img = pr.image
 page_w_pt, page_h_pt = pr.page_w_pt, pr.page_h_pt
 
-MAX_W = 900
+# imagem para clique (mais leve)
+MAX_W = 950
 disp_w = min(MAX_W, img.width)
 display_scale = disp_w / img.width
 disp_h = int(img.height * display_scale)
 disp_img = img.resize((disp_w, disp_h), Image.LANCZOS)
 
-st.subheader(f"1) Desenha um rectângulo na página (modo actual: **{mode}**)")
+# rects guardados da página
+page_rects = st.session_state.rects_by_page.get(page_index, {})
+rect_text_pt = page_rects.get("texto")
+rect_stamp_pt = page_rects.get("stamp")
 
-# IMPORTANT: a API do st_canvas aceita background_image (PIL). O package "-fix" trata da compatibilidade com Streamlit recente.
-canvas_result = st_canvas(
-    fill_color="rgba(0, 0, 0, 0)",
-    stroke_width=2,
-    stroke_color="#ff0000",
-    background_image=disp_img,
-    update_streamlit=True,
-    height=disp_h,
-    width=disp_w,
-    drawing_mode="rect",
-    key=f"canvas_{pdf_hash}_{page_index}",
+# Seleção por 2 cliques
+st.subheader(f"1) Seleccionar área com 2 cliques (modo actual: **{mode}**)")
+
+st.write(
+    "Clica **uma vez** no canto superior esquerdo e **uma vez** no canto inferior direito. "
+    "Depois clica **Guardar área**."
 )
 
-last_rect_disp = get_last_rect_from_canvas(canvas_result.json_data)
+# preview com overlays + rect em progresso
+selecting_rect_disp = None
+if st.session_state.click_stage == 1 and st.session_state.p1 is not None:
+    selecting_rect_disp = (st.session_state.p1[0], st.session_state.p1[1], st.session_state.p1[0], st.session_state.p1[1])
 
-col_a, col_b, _ = st.columns([1, 1, 3], vertical_alignment="center")
+# Usar o preview para clicar (mais robusto que canvas no Cloud)
+preview_click_img = build_preview_image(
+    base_img=img,
+    page_w_pt=page_w_pt,
+    page_h_pt=page_h_pt,
+    rect_text_pt=rect_text_pt,
+    rect_stamp_pt=rect_stamp_pt,
+    message=message,
+    font_pt=int(font_pt),
+    stamp_pil=stamp_pil,
+    keep_ratio=keep_ratio,
+)
+
+preview_click_disp = preview_click_img.resize((disp_w, disp_h), Image.LANCZOS)
+
+coords = streamlit_image_coordinates(preview_click_disp, key=f"imgcoords_{pdf_hash}_{page_index}")
+
+# Quando há clique, coords tem {'x':..., 'y':..., ...}
+if coords is not None and "x" in coords and "y" in coords:
+    x, y = float(coords["x"]), float(coords["y"])
+    if st.session_state.click_stage == 0:
+        st.session_state.p1 = (x, y)
+        st.session_state.click_stage = 1
+    else:
+        # segundo clique -> define rect em display coords
+        p1 = st.session_state.p1
+        p2 = (x, y)
+        st.session_state.p2 = p2
+        st.session_state.click_stage = 2  # pronto
+
+# Mostrar rect em progresso
+rect_disp_candidate = None
+if st.session_state.click_stage == 1 and st.session_state.p1 is not None:
+    st.info(f"1º clique guardado: {st.session_state.p1}. Agora clica o 2º canto.")
+elif st.session_state.click_stage == 2 and st.session_state.p1 is not None and getattr(st.session_state, "p2", None) is not None:
+    rect_disp_candidate = (st.session_state.p1[0], st.session_state.p1[1], st.session_state.p2[0], st.session_state.p2[1])
+    st.success(f"Rectângulo pronto (display px): {tuple(round(v,1) for v in rect_disp_candidate)}")
+
+col_a, col_b, col_c = st.columns([1, 1, 3], vertical_alignment="center")
 with col_a:
-    apply_rect = st.button("Guardar área deste rectângulo")
+    save_area = st.button("Guardar área")
 with col_b:
-    clear_page = st.button("Limpar áreas desta página")
+    reset_clicks = st.button("Reset cliques")
 
-if clear_page:
-    st.session_state.rects_by_page.pop(page_index, None)
-    st.success("Áreas desta página limpas.")
+if reset_clicks:
+    st.session_state.click_stage = 0
+    st.session_state.p1 = None
+    if hasattr(st.session_state, "p2"):
+        del st.session_state["p2"]
     st.rerun()
 
-if apply_rect:
-    if not last_rect_disp:
-        st.warning("Ainda não desenhaste nenhum rectângulo.")
+if save_area:
+    if rect_disp_candidate is None:
+        st.warning("Ainda não tens os 2 cliques. Faz os 2 cliques primeiro.")
     else:
         rect_pt = rect_disp_to_rect_pt(
-            last_rect_disp,
-            display_scale=display_scale,
+            rect_disp_candidate,
+            display_scale=1.0,  # coords já são em display (preview_click_disp)
+            img_w_px=disp_w,    # atenção: aqui a imagem base é a 'disp'
+            img_h_px=disp_h,
+            page_w_pt=page_w_pt,
+            page_h_pt=page_h_pt,
+        )
+        # rect_disp_to_rect_pt acima assume img_w_px/img_h_px do render original.
+        # Aqui usamos a imagem em display; portanto precisamos ajustar: usar o render original:
+        # Recalcular com img original:
+        rect_pt = rect_disp_to_rect_pt(
+            rect_disp_candidate,
+            display_scale=display_scale,  # display -> original render
             img_w_px=img.width,
             img_h_px=img.height,
             page_w_pt=page_w_pt,
             page_h_pt=page_h_pt,
         )
+
         st.session_state.rects_by_page.setdefault(page_index, {})
         st.session_state.rects_by_page[page_index][mode] = rect_pt
+
+        st.session_state.click_stage = 0
+        st.session_state.p1 = None
+        if hasattr(st.session_state, "p2"):
+            del st.session_state["p2"]
+
         st.success(f"Área guardada para **{mode}** na página {page_index + 1}.")
         st.rerun()
 
+with col_c:
+    if st.button("Limpar áreas desta página"):
+        st.session_state.rects_by_page.pop(page_index, None)
+        st.session_state.click_stage = 0
+        st.session_state.p1 = None
+        if hasattr(st.session_state, "p2"):
+            del st.session_state["p2"]
+        st.success("Áreas desta página limpas.")
+        st.rerun()
+
+# Recarregar rects (podem ter mudado)
 page_rects = st.session_state.rects_by_page.get(page_index, {})
 rect_text_pt = page_rects.get("texto")
 rect_stamp_pt = page_rects.get("stamp")
@@ -391,4 +474,4 @@ if st.button("Gerar PDF final", disabled=not can_generate):
         mime="application/pdf",
     )
 
-st.caption("Dica: escolhe o modo (texto/stamp), desenha o rectângulo e clica em “Guardar área deste rectângulo”. O stamp é convertido para PNG em memória.")
+st.caption("Nesta versão não usamos canvas (que pode ficar branco no Cloud). Seleccionas a área com 2 cliques na imagem.")
